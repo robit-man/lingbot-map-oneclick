@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#090b10" />
+    <meta
+      name="description"
+      content="Private LingBot-Map streaming 3D reconstruction deployment"
+    />
+    <title>LingBot Maproom</title>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div>
+          <p class="eyebrow">Streaming reconstruction</p>
+          <h1>LingBot Maproom</h1>
+        </div>
+        <div id="service-state" class="pill muted">Locked</div>
+      </header>
+
+      <section class="layout">
+        <aside class="panel controls">
+          <div class="section-heading">
+            <span>01</span>
+            <div><h2>Access</h2><p>Use the token created during deployment.</p></div>
+          </div>
+          <div class="token-row">
+            <input id="token" type="password" autocomplete="off" placeholder="Deployment token" />
+            <button id="unlock" class="secondary" type="button">Unlock</button>
+          </div>
+
+          <div class="rule"></div>
+          <div class="section-heading">
+            <span>02</span>
+            <div><h2>Your video</h2><p>Walk around a place, then send the clip.</p></div>
+          </div>
+          <label id="dropzone" class="dropzone" for="files">
+            <input id="files" type="file" multiple accept="video/*,image/jpeg,image/png,image/webp" />
+            <strong>Choose or drop a video</strong>
+            <small>MP4, MOV, WebM, JPG, PNG or WebP</small>
+            <output id="file-summary">No files selected</output>
+          </label>
+
+          <details class="advanced">
+            <summary>Advanced settings</summary>
+            <div class="option-grid">
+              <label>Sample FPS<input id="fps" type="number" min="1" max="30" value="8" /></label>
+              <label>Frame cap<input id="max-frames" type="number" min="2" max="96" value="48" /></label>
+              <label>Scale frames<input id="scale-frames" type="number" min="1" max="8" value="4" /></label>
+              <label>Keyframe step<input id="keyframe" type="number" min="1" max="16" value="2" /></label>
+            </div>
+            <label class="range-label">
+              <span>Confidence filter <output id="confidence-value">50%</output></span>
+              <input id="confidence" type="range" min="0" max="95" value="50" />
+            </label>
+            <label class="check-row">
+              <input id="cameras" type="checkbox" checked /> Include camera path
+            </label>
+          </details>
+
+          <button id="reconstruct" class="primary" type="button" disabled>
+            Build 3D map
+          </button>
+          <div id="job-state" class="job-state" aria-live="polite">Unlock the service to begin.</div>
+          <div class="progress-track"><span id="progress"></span></div>
+        </aside>
+
+        <section class="panel viewport-panel">
+          <div class="viewport-head">
+            <div><p class="eyebrow">Output</p><h2>Spatial preview</h2></div>
+            <a id="download" class="download disabled" download>Download GLB</a>
+          </div>
+          <div id="viewport" class="viewport">
+            <canvas id="scene"></canvas>
+            <div id="empty-state" class="empty-state">
+              <div class="orb"></div>
+              <p>Your 3D map will appear here.</p>
+              <small>Drag to orbit · scroll to zoom</small>
+            </div>
+          </div>
+          <dl id="metrics" class="metrics">
+            <div><dt>Frames</dt><dd>—</dd></div>
+            <div><dt>Inference</dt><dd>—</dd></div>
+            <div><dt>GPU peak</dt><dd>—</dd></div>
+            <div><dt>Artifact</dt><dd>—</dd></div>
+          </dl>
+        </section>
+      </section>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

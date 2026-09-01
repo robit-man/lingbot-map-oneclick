@@ -1,0 +1,16 @@
+*
+!pyproject.toml
+!LICENSE.txt
+!demo.py
+!lingbot_map/
+!lingbot_map/**
+!webapp/
+!webapp/**
+!web/
+!web/package.json
+!web/package-lock.json
+!web/index.html
+!web/src/
+!web/src/**
+!deploy/
+!deploy/requirements.txt

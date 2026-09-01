@@ -1,0 +1,19 @@
+[Unit]
+Description=LingBot-Map GPU web deployment
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@WORKDIR@
+ExecStart=@WORKDIR@/scripts/deploy.sh run
+ExecStop=@WORKDIR@/scripts/deploy.sh down
+Restart=on-failure
+RestartSec=20
+TimeoutStartSec=infinity
+TimeoutStopSec=90
+KillMode=control-group
+SyslogIdentifier=lingbot-map
+
+[Install]
+WantedBy=default.target

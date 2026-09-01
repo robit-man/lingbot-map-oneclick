@@ -1,0 +1,111 @@
+name: lingbot-map
+
+x-model-environment: &model-environment
+  LINGBOT_MODEL_DIR: /models
+  LINGBOT_MODEL_REPO: ${LINGBOT_MODEL_REPO:-robbyant/lingbot-map}
+  LINGBOT_MODEL_FILENAME: ${LINGBOT_MODEL_FILENAME:-lingbot-map.pt}
+  LINGBOT_MODEL_REVISION: ${LINGBOT_MODEL_REVISION:-204754b72bb24f561f8d7e7e1e4e4cd9e809adf9}
+  LINGBOT_MODEL_SHA256: ${LINGBOT_MODEL_SHA256:-ee665103348e07e6b826d529b8e61de8f413d5432a4f2e84970d6c8fd2e1cd72}
+  LINGBOT_MODEL_SIZE_BYTES: ${LINGBOT_MODEL_SIZE_BYTES:-4632303465}
+  HF_HOME: /models/.cache/huggingface
+  HF_TOKEN: ${HF_TOKEN:-}
+
+services:
+  weights:
+    profiles: [tools]
+    build:
+      context: .
+      target: runtime
+    image: lingbot-map-web:local
+    entrypoint: ["python", "-m", "webapp.weights"]
+    environment: *model-environment
+    volumes:
+      - ./data/models:/models
+
+  app:
+    build:
+      context: .
+      target: runtime
+    image: lingbot-map-web:local
+    init: true
+    read_only: true
+    shm_size: 8gb
+    environment:
+      <<: *model-environment
+      LINGBOT_API_TOKEN: ${LINGBOT_API_TOKEN:?set by scripts/deploy.sh}
+      LINGBOT_JOBS_DIR: /data/jobs
+      LINGBOT_MAX_UPLOAD_BYTES: ${LINGBOT_MAX_UPLOAD_BYTES:-94371840}
+      LINGBOT_MAX_FILES: ${LINGBOT_MAX_FILES:-160}
+      LINGBOT_MAX_FRAMES: ${LINGBOT_MAX_FRAMES:-96}
+      LINGBOT_MAX_QUEUE: ${LINGBOT_MAX_QUEUE:-4}
+      LINGBOT_RETAIN_JOBS: ${LINGBOT_RETAIN_JOBS:-20}
+      LINGBOT_SCALE_FRAMES: ${LINGBOT_SCALE_FRAMES:-4}
+      LINGBOT_CAMERA_ITERATIONS: ${LINGBOT_CAMERA_ITERATIONS:-1}
+      LINGBOT_USE_SDPA: ${LINGBOT_USE_SDPA:-1}
+      LINGBOT_REQUIRE_GPU_BROKER: "1"
+      OLLAMA_UNIFY_GPU_LEASE: ${OLLAMA_UNIFY_GPU_LEASE:?run through docker gpu run}
+      OLLAMA_UNIFY_SOCKET: /run/ollama-unify/gpu-negotiator.sock
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:?run through docker gpu run}
+      NVIDIA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:?run through docker gpu run}
+    ports:
+      - "127.0.0.1:${LINGBOT_PORT:-8080}:8080"
+    volumes:
+      - ./data/models:/models
+      - ./data/jobs:/data/jobs
+      - /run/ollama-unify/gpu-negotiator.sock:/run/ollama-unify/gpu-negotiator.sock
+    tmpfs:
+      - /tmp:size=2g,mode=1777
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids:
+                - ${CUDA_VISIBLE_DEVICES:?run through docker gpu run}
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/readyz"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 4
+    stop_grace_period: 45s
+    networks: [private]
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.8.2
+    read_only: true
+    depends_on:
+      app:
+        condition: service_healthy
+    command:
+      - tunnel
+      - --no-autoupdate
+      - --protocol
+      - http2
+      - --metrics
+      - 0.0.0.0:2000
+      - --url
+      - http://app:8080
+    networks: [private]
+
+  cloudflared-named:
+    profiles: [named-tunnel]
+    image: cloudflare/cloudflared:2026.8.2
+    read_only: true
+    depends_on:
+      app:
+        condition: service_healthy
+    command:
+      - tunnel
+      - --no-autoupdate
+      - --metrics
+      - 0.0.0.0:2000
+      - run
+      - --token
+      - ${CLOUDFLARE_TUNNEL_TOKEN:-token-not-configured}
+    networks: [private]
+
+networks:
+  private:
+    driver: bridge
