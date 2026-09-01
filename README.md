@@ -53,6 +53,29 @@ Three.js viewer and can also be downloaded as a GLB.
 See [DEPLOYMENT.md](DEPLOYMENT.md) for configuration and operational details,
 and [UPSTREAM.md](UPSTREAM.md) for source provenance.
 
+### NOCLIP grounded reconstruction API
+
+This repository is also the production reconstruction worker for NOCLIP. Run
+it as a loopback-only service by setting `LINGBOT_DEPLOYMENT_MODE=internal` in
+`.env`; the normal CUDA broker lifecycle is unchanged, but Cloudflared is not
+started. Configure `noclip-backend` with the local URL and the same generated
+token:
+
+```dotenv
+LINGBOT_MAP_SERVICE_URL=http://127.0.0.1:7410
+LINGBOT_MAP_SERVICE_TOKEN=<same value as LINGBOT_API_TOKEN>
+```
+
+The bearer-protected `POST /v1/reconstructions` accepts ordered image/video
+media plus an exact `noclip.lingbot.request/1.0` manifest. The worker validates
+WGS84 + ENU + OpenCV axes + `xyzw`, reconstructs the GLB, and emits
+`trajectory.json` in the exact local coordinate frame used by that GLB. Status,
+result, artifact, and cancellation routes retain the same job ID across API
+restart; completed jobs remain readable and interrupted work becomes an
+explicit terminal failure for backend recovery. NOCLIP—not this GPU worker—is
+the owner of account authentication, holdings-derived daily quota admission,
+encrypted media storage, scan publication, and world-placement revisions.
+
 -----
 
 ### 🗺️ Meet LingBot-Map! We've built a feed-forward 3D foundation model for streaming 3D reconstruction! 🏗️🌍

@@ -53,8 +53,13 @@ load_env() {
   source "${env_file}"
   set +a
   export LINGBOT_PORT="${LINGBOT_PORT:-8080}"
+  export LINGBOT_DEPLOYMENT_MODE="${LINGBOT_DEPLOYMENT_MODE:-public}"
   export LINGBOT_VRAM_MIB="${LINGBOT_VRAM_MIB:-32768}"
   export LINGBOT_READY_TIMEOUT="${LINGBOT_READY_TIMEOUT:-1800}"
+  if [[ "${LINGBOT_DEPLOYMENT_MODE}" != "public" && "${LINGBOT_DEPLOYMENT_MODE}" != "internal" ]]; then
+    printf 'LINGBOT_DEPLOYMENT_MODE must be public or internal\n' >&2
+    return 2
+  fi
 }
 
 compose_with_placeholders() {
@@ -122,9 +127,13 @@ run_foreground() {
   pull_weights
 
   local gpu_uuid tunnel_service ready_command
+  local -a services
   gpu_uuid="$(select_gpu)"
-  tunnel_service="cloudflared"
-  if [[ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]]; then
+  tunnel_service=""
+  if [[ "${LINGBOT_DEPLOYMENT_MODE}" == "public" ]]; then
+    tunnel_service="cloudflared"
+  fi
+  if [[ "${LINGBOT_DEPLOYMENT_MODE}" == "public" && -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]]; then
     if [[ -z "${LINGBOT_PUBLIC_URL:-}" ]]; then
       printf 'LINGBOT_PUBLIC_URL is required with CLOUDFLARE_TUNNEL_TOKEN\n' >&2
       return 2
@@ -132,6 +141,10 @@ run_foreground() {
     tunnel_service="cloudflared-named"
   fi
   ready_command="curl -fsS http://127.0.0.1:${LINGBOT_PORT}/readyz >/dev/null"
+  services=(app)
+  if [[ -n "${tunnel_service}" ]]; then
+    services+=("${tunnel_service}")
+  fi
   printf 'LingBot-Map: reserving %s MiB on %s\n' "${LINGBOT_VRAM_MIB}" "${gpu_uuid}"
 
   export CUDA_VISIBLE_DEVICES="${gpu_uuid}"
@@ -146,7 +159,7 @@ run_foreground() {
       --project-directory "${project_dir}" \
       --env-file "${env_file}" \
       -f "${compose_file}" \
-      up --remove-orphans --abort-on-container-failure app "${tunnel_service}"
+      up --remove-orphans --abort-on-container-failure "${services[@]}"
 }
 
 down_stack() {
@@ -194,6 +207,10 @@ show_logs() {
 
 show_url() {
   load_env
+  if [[ "${LINGBOT_DEPLOYMENT_MODE}" == "internal" ]]; then
+    printf 'http://127.0.0.1:%s\n' "${LINGBOT_PORT}"
+    return
+  fi
   if [[ -n "${LINGBOT_PUBLIC_URL:-}" ]]; then
     printf '%s\n' "${LINGBOT_PUBLIC_URL}"
     return
@@ -225,8 +242,12 @@ verify_deployment() {
   curl -fsS "http://127.0.0.1:${LINGBOT_PORT}/readyz" >/dev/null
   printf 'PASS\n'
   printf 'tunnel: '
-  show_url >/dev/null
-  printf 'PASS\n'
+  if [[ "${LINGBOT_DEPLOYMENT_MODE}" == "internal" ]]; then
+    printf 'SKIP (internal mode)\n'
+  else
+    show_url >/dev/null
+    printf 'PASS\n'
+  fi
   printf 'overall: PASS\n'
 }
 

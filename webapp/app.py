@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import shutil
 import uuid
@@ -22,6 +23,11 @@ from .inputs import (
     validate_image_files,
 )
 from .jobs import JobManager, QueueFullError
+from .noclip_contract import (
+    NOCLIP_REQUEST_SCHEMA,
+    NOCLIP_RESULT_SCHEMA,
+    validate_noclip_manifest,
+)
 
 
 logging.basicConfig(
@@ -217,6 +223,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(503, "job manager is not ready")
             job = manager.submit(
                 job_id,
+                contract="browser",
                 image_dir=image_dir,
                 result_dir=job_dir / "result",
                 num_scale_frames=num_scale_frames,
@@ -276,6 +283,201 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not path.is_file():
             raise HTTPException(404, "summary file not found")
         return FileResponse(path, media_type="application/json")
+
+    @application.post("/v1/reconstructions", dependencies=[auth], status_code=202)
+    async def create_noclip_reconstruction(
+        media: Annotated[list[UploadFile], File()],
+        manifest: Annotated[str, Form()],
+        model: Annotated[str | None, Form()] = None,
+        revision: Annotated[str | None, Form()] = None,
+    ):
+        try:
+            manifest_data = validate_noclip_manifest(json.loads(manifest))
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        requested_model = model or manifest_data.get("model") or settings.model_repo
+        requested_revision = (
+            revision or manifest_data.get("revision") or settings.model_revision
+        )
+        if requested_model != settings.model_repo:
+            raise HTTPException(409, "requested model is not resident on this worker")
+        if requested_revision != settings.model_revision:
+            raise HTTPException(409, "requested revision is not resident on this worker")
+        job_id = uuid.uuid4().hex
+        job_dir = settings.jobs_dir / job_id
+        try:
+            uploaded = await _save_uploads(
+                media,
+                job_dir / "upload",
+                byte_limit=settings.max_upload_bytes,
+                file_limit=settings.max_files,
+            )
+            image_uploads = [path for path in uploaded if path.suffix in IMAGE_SUFFIXES]
+            video_uploads = [path for path in uploaded if path.suffix in VIDEO_SUFFIXES]
+            if video_uploads and image_uploads:
+                raise HTTPException(400, "upload either one video or an image sequence")
+            if len(video_uploads) > 1:
+                raise HTTPException(400, "upload only one video")
+            options = manifest_data.get("options") or {}
+            max_frames = min(
+                settings.max_frames,
+                max(2, int(options.get("maxFrames", settings.max_frames))),
+            )
+            fps = min(30, max(1, int(options.get("videoFps", 8))))
+            image_dir = job_dir / "frames"
+            if video_uploads:
+                _paths, input_summary = await asyncio.to_thread(
+                    extract_video_frames,
+                    video_uploads[0],
+                    image_dir,
+                    fps=fps,
+                    max_frames=max_frames,
+                )
+            else:
+                if len(image_uploads) < 2:
+                    raise HTTPException(400, "upload at least two images")
+                selected = image_uploads[:max_frames]
+                await asyncio.to_thread(validate_image_files, selected)
+                image_dir.mkdir(parents=True, exist_ok=True)
+                for index, source in enumerate(selected):
+                    source.replace(image_dir / f"{index:06d}{source.suffix}")
+                input_summary = {"input_mode": "images", "frames_used": len(selected)}
+            if manager is None:
+                raise HTTPException(503, "job manager is not ready")
+            job = manager.submit(
+                job_id,
+                contract=NOCLIP_REQUEST_SCHEMA,
+                image_dir=image_dir,
+                result_dir=job_dir / "result",
+                num_scale_frames=min(
+                    8, max(1, int(options.get("numScaleFrames", settings.default_scale_frames)))
+                ),
+                keyframe_interval=min(
+                    16, max(1, int(options.get("keyframeInterval", 2)))
+                ),
+                confidence_percentile=min(
+                    95.0, max(0.0, float(options.get("confidencePercentile", 50.0)))
+                ),
+                include_cameras=bool(options.get("includeCameras", False)),
+                input_summary={
+                    **input_summary,
+                    "model": settings.model_repo,
+                    "revision": settings.model_revision,
+                },
+                noclip_manifest=manifest_data,
+            )
+            return {"jobId": job.id, "status": "queued"}
+        except QueueFullError as exc:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(429, str(exc)) from exc
+        except HTTPException:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise
+        except (TypeError, ValueError) as exc:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(400, str(exc)) from exc
+        except Exception:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            LOGGER.exception("failed to stage NOCLIP job %s", job_id)
+            raise HTTPException(500, "could not stage the reconstruction")
+
+    @application.get("/v1/reconstructions/{job_id}", dependencies=[auth])
+    async def noclip_reconstruction_status(job_id: str):
+        if manager is None:
+            raise HTTPException(503, "job manager is not ready")
+        job = manager.get(job_id)
+        if job is None or job.contract != NOCLIP_REQUEST_SCHEMA:
+            raise HTTPException(404, "reconstruction not found")
+        status = {"complete": "completed", "running": "processing"}.get(
+            job.status, job.status
+        )
+        return {
+            "jobId": job.id,
+            "status": status,
+            "stage": "ready" if status == "completed" else status,
+            "progress": job.progress / 100,
+            "message": job.message,
+            "metrics": job.summary or {},
+        }
+
+    @application.delete("/v1/reconstructions/{job_id}", dependencies=[auth], status_code=202)
+    async def cancel_noclip_reconstruction(job_id: str):
+        if manager is None:
+            raise HTTPException(503, "job manager is not ready")
+        job = manager.get(job_id)
+        if job is None or job.contract != NOCLIP_REQUEST_SCHEMA:
+            raise HTTPException(404, "reconstruction not found")
+        if job.status in {"queued", "running"}:
+            manager.cancel(job_id)
+        return {"jobId": job.id, "status": job.status}
+
+    @application.get("/v1/reconstructions/{job_id}/result", dependencies=[auth])
+    async def noclip_reconstruction_result(job_id: str):
+        if manager is None:
+            raise HTTPException(503, "job manager is not ready")
+        job = manager.get(job_id)
+        if job is None or job.contract != NOCLIP_REQUEST_SCHEMA:
+            raise HTTPException(404, "reconstruction not found")
+        if job.status != "complete":
+            raise HTTPException(409, f"reconstruction is {job.status}")
+        result_dir = settings.jobs_dir / job_id / "result"
+        summary_path = result_dir / "summary.json"
+        trajectory_path = result_dir / "trajectory.json"
+        if not summary_path.is_file() or not trajectory_path.is_file():
+            raise HTTPException(500, "reconstruction contract artifacts are incomplete")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+        base = f"/v1/reconstructions/{job_id}/artifacts"
+        return {
+            "schema": NOCLIP_RESULT_SCHEMA,
+            "artifacts": [
+                {
+                    "kind": "reconstruction_glb",
+                    "url": f"{base}/reconstruction.glb",
+                    "fileName": "reconstruction.glb",
+                    "mimeType": "model/gltf-binary",
+                    "metadata": {
+                        "framesUsed": summary.get("frames_used"),
+                        "inferenceSeconds": summary.get("inference_seconds"),
+                        "resultBytes": summary.get("result_bytes"),
+                    },
+                },
+                {
+                    "kind": "trajectory",
+                    "url": f"{base}/trajectory.json",
+                    "fileName": "trajectory.json",
+                    "mimeType": "application/json",
+                    "metadata": {"frameCount": len(trajectory.get("frames") or [])},
+                },
+                {
+                    "kind": "manifest",
+                    "url": f"{base}/summary.json",
+                    "fileName": "summary.json",
+                    "mimeType": "application/json",
+                    "metadata": {},
+                },
+            ],
+            "frames": trajectory.get("frames") or [],
+            "summary": summary,
+        }
+
+    @application.get(
+        "/v1/reconstructions/{job_id}/artifacts/{file_name}", dependencies=[auth]
+    )
+    async def noclip_reconstruction_artifact(job_id: str, file_name: str):
+        if manager is None:
+            raise HTTPException(503, "job manager is not ready")
+        job = manager.get(job_id)
+        if job is None or job.contract != NOCLIP_REQUEST_SCHEMA:
+            raise HTTPException(404, "reconstruction not found")
+        safe_name = Path(file_name).name
+        if safe_name not in {"reconstruction.glb", "trajectory.json", "summary.json"}:
+            raise HTTPException(404, "artifact not found")
+        path = settings.jobs_dir / job_id / "result" / safe_name
+        if not path.is_file():
+            raise HTTPException(404, "artifact not found")
+        media_type = "model/gltf-binary" if path.suffix == ".glb" else "application/json"
+        return FileResponse(path, media_type=media_type, filename=safe_name)
 
     assets = settings.web_dist / "assets"
     if assets.is_dir():

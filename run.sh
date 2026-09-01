@@ -70,6 +70,12 @@ ensure_venv() {
 }
 
 ensure_cloudflared() {
+  local deployment_mode
+  "${deploy_script}" token >/dev/null
+  deployment_mode="$(awk -F= '$1 == "LINGBOT_DEPLOYMENT_MODE" { print $2; exit }' "${project_dir}/.env")"
+  if [[ "${deployment_mode:-public}" == "internal" ]]; then
+    return
+  fi
   if ! docker image inspect "${cloudflared_image}" >/dev/null 2>&1; then
     printf 'bootstrap: installing Cloudflared container %s\n' "${cloudflared_image}"
     docker pull "${cloudflared_image}"
@@ -153,7 +159,11 @@ wait_until_ready() {
   fi
   timeout="${LINGBOT_BOOTSTRAP_TIMEOUT:-1800}"
   deadline=$((SECONDS + timeout))
-  printf 'deployment: waiting for the resident model and public tunnel'
+  if [[ "${LINGBOT_DEPLOYMENT_MODE:-public}" == "internal" ]]; then
+    printf 'deployment: waiting for the resident model'
+  else
+    printf 'deployment: waiting for the resident model and public tunnel'
+  fi
   while (( SECONDS < deadline )); do
     if ! systemctl --user is-active --quiet lingbot-map.service; then
       if systemctl --user is-failed --quiet lingbot-map.service; then
@@ -165,8 +175,12 @@ wait_until_ready() {
       url="$(${deploy_script} url 2>/dev/null || true)"
       if [[ -n "${url}" ]]; then
         printf ' ready\n'
-        printf '\nLingBot Maproom is live.\n'
-        printf '  Site:  %s\n' "${url}"
+        printf '\nLingBot Maproom is ready.\n'
+        if [[ "${LINGBOT_DEPLOYMENT_MODE:-public}" == "internal" ]]; then
+          printf '  Internal API: %s\n' "${url}"
+        else
+          printf '  Site:  %s\n' "${url}"
+        fi
         printf '  Token: %s\n' "$(${deploy_script} token)"
         printf '  Local: http://127.0.0.1:%s\n' "${LINGBOT_PORT:-8080}"
         printf '\nDrop in one video, click “Build 3D map,” and the result opens in the site.\n'

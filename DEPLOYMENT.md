@@ -76,6 +76,45 @@ LINGBOT_PUBLIC_URL=https://map.example.com
 The application bearer token remains required in both modes. Cloudflare Access
 can be added in front of the named tunnel for another authentication layer.
 
+## NOCLIP Internal Mode
+
+For `api.noclip.org`, disable the public tunnel and keep the worker on its
+loopback bind:
+
+```dotenv
+LINGBOT_DEPLOYMENT_MODE=internal
+LINGBOT_PORT=7410
+```
+
+Then run the ordinary supervised deployment:
+
+```bash
+./run.sh start
+./run.sh verify
+```
+
+`verify` checks the checkpoint and resident-model readiness and reports the
+tunnel gate as skipped. `./run.sh url` returns the loopback URL. Copy the value
+from `./run.sh token` into the backend's `LINGBOT_MAP_SERVICE_TOKEN`; never put
+it in a URL or expose port 7410 on a public interface. Internal mode still runs
+`docker gpu discover`, reserves one exact UUID with `docker gpu run`, calls
+`prepare` before inference growth, and returns the lease to ready state after
+cleanup.
+
+The NOCLIP contract endpoints are:
+
+- `POST /v1/reconstructions`
+- `GET|DELETE /v1/reconstructions/{jobId}`
+- `GET /v1/reconstructions/{jobId}/result`
+- `GET /v1/reconstructions/{jobId}/artifacts/{fileName}`
+
+All require `Authorization: Bearer <LINGBOT_API_TOKEN>`. Result payloads contain
+the reconstruction GLB, trajectory artifact, source media/sensor mapping,
+frame poses in the exported model frame, and measured inference seconds.
+Persisted completed/failed/cancelled job records are reloaded after restart;
+queued/running records are made terminal with an interruption reason so the
+NOCLIP backend never polls a vanished job indefinitely.
+
 ## Operations
 
 ```bash

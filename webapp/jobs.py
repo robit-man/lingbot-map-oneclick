@@ -29,6 +29,7 @@ class Job:
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
     summary: dict[str, Any] | None = None
+    contract: str | None = None
 
     def public(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -59,6 +60,7 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lingbot")
+        self._load_retained()
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -66,6 +68,42 @@ class JobManager:
     def get(self, job_id: str) -> Job | None:
         with self._lock:
             return self._jobs.get(job_id)
+
+    def cancel(self, job_id: str) -> Job | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status not in {"queued", "running"}:
+                return job
+            was_queued = job.status == "queued"
+            job.status = "cancelled"
+            job.message = (
+                "Cancelled before GPU admission"
+                if was_queued
+                else "Cancellation accepted; GPU cleanup is completing"
+            )
+            job.progress = 100
+            job.updated_at = _now()
+            self._persist(job)
+            return job
+
+    def _load_retained(self) -> None:
+        """Restore durable results and make interrupted work terminal after restart."""
+        allowed = {field.name for field in Job.__dataclass_fields__.values()}
+        for job_file in sorted(self.root.glob("*/job.json")):
+            try:
+                payload = json.loads(job_file.read_text(encoding="utf-8"))
+                job = Job(**{key: value for key, value in payload.items() if key in allowed})
+                if job.id != job_file.parent.name:
+                    raise ValueError("persisted job id does not match its directory")
+                if job.status in {"queued", "running"}:
+                    job.status = "failed"
+                    job.message = "Reconstruction was interrupted by a service restart"
+                    job.updated_at = _now()
+                    self._persist(job)
+                self._jobs[job.id] = job
+            except Exception:
+                LOGGER.warning("ignoring invalid persisted job %s", job_file, exc_info=True)
+        self._prune()
 
     def _persist(self, job: Job) -> None:
         job_dir = self.root / job.id
@@ -79,25 +117,29 @@ class JobManager:
 
     def _update(self, job: Job, **changes: Any) -> None:
         with self._lock:
+            if job.status == "cancelled" and changes.get("status") != "cancelled":
+                return
             for key, value in changes.items():
                 setattr(job, key, value)
             job.updated_at = _now()
             self._persist(job)
 
-    def submit(self, job_id: str, **parameters: Any) -> Job:
+    def submit(self, job_id: str, *, contract: str | None = None, **parameters: Any) -> Job:
         with self._lock:
             active = sum(
                 job.status in {"queued", "running"} for job in self._jobs.values()
             )
             if active >= self.max_queue:
                 raise QueueFullError("the reconstruction queue is full")
-            job = Job(id=job_id)
+            job = Job(id=job_id, contract=contract)
             self._jobs[job_id] = job
             self._persist(job)
         self._executor.submit(self._execute, job, parameters)
         return job
 
     def _execute(self, job: Job, parameters: dict[str, Any]) -> None:
+        if job.status == "cancelled":
+            return
         self._update(
             job,
             status="running",
@@ -141,7 +183,7 @@ class JobManager:
                 (
                     job
                     for job in self._jobs.values()
-                    if job.status in {"complete", "failed"}
+                    if job.status in {"complete", "failed", "cancelled"}
                 ),
                 key=lambda item: item.updated_at,
             )

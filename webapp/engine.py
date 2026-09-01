@@ -101,12 +101,14 @@ class InferenceEngine:
         confidence_percentile: float,
         include_cameras: bool,
         input_summary: dict[str, Any],
+        noclip_manifest: dict[str, Any] | None = None,
         progress_callback: Callable[[int, str], None] | None = None,
     ) -> dict[str, Any]:
         import torch
 
         from demo import load_images, postprocess, prepare_for_visualization
         from lingbot_map.vis.glb_export import predictions_to_glb
+        from .noclip_contract import build_aligned_camera_frames, write_noclip_trajectory
 
         if not self.ready or self.model is None:
             raise RuntimeError("model is not ready")
@@ -196,6 +198,18 @@ class InferenceEngine:
             scene.export(glb_path)
             report(97, "Finalizing the browser preview")
 
+            noclip_frames: list[dict[str, Any]] = []
+            trajectory_path: Path | None = None
+            if noclip_manifest is not None:
+                noclip_frames = build_aligned_camera_frames(
+                    prepared_for_export, noclip_manifest
+                )
+                trajectory_path = write_noclip_trajectory(
+                    result_dir,
+                    capture_session_id=str(noclip_manifest["captureSessionId"]),
+                    frames=noclip_frames,
+                )
+
             summary = {
                 "frames_used": frame_count,
                 "num_scale_frames": scale_frames,
@@ -207,6 +221,11 @@ class InferenceEngine:
                 "result_bytes": glb_path.stat().st_size,
                 "model": dict(self.load_summary),
                 "input": input_summary,
+                "noclip": {
+                    "capture_session_id": noclip_manifest.get("captureSessionId"),
+                    "trajectory_frames": len(noclip_frames),
+                    "trajectory_bytes": trajectory_path.stat().st_size,
+                } if noclip_manifest is not None and trajectory_path is not None else None,
             }
             (result_dir / "summary.json").write_text(
                 json.dumps(summary, indent=2, sort_keys=True) + "\n",
