@@ -99,25 +99,10 @@ select_gpu() {
   discovery_file="$(mktemp)"
   trap 'rm -f -- "${discovery_file}"' RETURN
   docker gpu discover >"${discovery_file}"
-  selected="$(python3 - "${discovery_file}" "${LINGBOT_GPU_UUID:-}" <<'PY'
-import json
-import sys
-
-path, requested = sys.argv[1:]
-with open(path, encoding="utf-8") as handle:
-    discovery = json.load(handle)
-selected_ids = set(discovery.get("selected_gpu_ids") or [])
-gpus = [gpu for gpu in discovery.get("gpus", []) if gpu.get("uuid") in selected_ids]
-if requested:
-    if requested not in selected_ids:
-        raise SystemExit(f"configured GPU is not broker-selected: {requested}")
-    print(requested)
-elif gpus:
-    print(max(gpus, key=lambda gpu: int(gpu.get("free_mib") or 0))["uuid"])
-else:
-    raise SystemExit("docker gpu discover returned no eligible scoped GPU")
-PY
-)"
+  selected="$(python3 "${project_dir}/webapp/gpu_selection.py" \
+    "${discovery_file}" \
+    "${LINGBOT_GPU_UUID:-}" \
+    "${LINGBOT_GPU_INDEX:-}")"
   printf '%s\n' "${selected}"
 }
 

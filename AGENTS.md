@@ -8,6 +8,10 @@ checkpoint, security, or ownership changes.
 - Before changing or starting this CUDA workload, run `docker gpu discover`.
 - Launch only through the repository's scoped `docker gpu run --gpu GPU_UUID`
   workflow. The container must receive exactly the reserved UUID and lease.
+- `LINGBOT_GPU_INDEX` is an operator convenience only. Resolve it against the
+  ordered `docker gpu discover` list, require broker eligibility, and pass the
+  resulting exact UUID to the lease and child. Never pass the numeric index to
+  CUDA or Compose. Reject simultaneous index and UUID constraints.
 - Call broker `prepare` before inference growth and `ready` after CUDA cleanup.
   Do not add static Compose GPU counts or anonymous CUDA allocation.
 - `LINGBOT_DEPLOYMENT_MODE=internal` is the NOCLIP production mode: loopback

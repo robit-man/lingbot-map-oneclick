@@ -53,6 +53,12 @@ Three.js viewer and can also be downloaded as a GLB.
 See [DEPLOYMENT.md](DEPLOYMENT.md) for configuration and operational details,
 and [UPSTREAM.md](UPSTREAM.md) for source provenance.
 
+GPU placement is broker scoped. Set `LINGBOT_GPU_INDEX=1` in `.env` to pin the
+service to GPU 1; startup resolves the index to an eligible UUID and exposes
+only that exact UUID to the container. An explicit `LINGBOT_GPU_UUID` is also
+supported, and leaving both selectors blank preserves automatic headroom-based
+placement.
+
 ### NOCLIP grounded reconstruction API
 
 This repository is also the production reconstruction worker for NOCLIP. Run

@@ -51,11 +51,14 @@ To use another checkpoint, change the repository, filename, revision, checksum,
 and size together. Set `LINGBOT_MODEL_PATH` only when a checkpoint is already
 mounted in the app container.
 
-The deploy script runs `docker gpu discover` on every start. Leave
-`LINGBOT_GPU_UUID` blank to select the broker-eligible GPU with the most current
-headroom, or set it to one of the UUIDs returned by discovery. The launch is
-always wrapped in a scoped `docker gpu run`; the app also calls `prepare` before
-each inference burst and `ready` after CUDA memory stabilizes.
+The deploy script runs `docker gpu discover` on every start. To constrain the
+service to the host's GPU 1, set `LINGBOT_GPU_INDEX=1`; the script resolves that
+entry to its current UUID, verifies that the broker selected it, and passes only
+that UUID to both `docker gpu run` and the container. `LINGBOT_GPU_UUID` remains
+available for an explicit UUID constraint, but the index and UUID selectors are
+mutually exclusive. Leave both blank (or set the index to `auto`) to select the
+broker-eligible GPU with the most current headroom. The app also calls `prepare`
+before each inference burst and `ready` after CUDA memory stabilizes.
 
 ## Cloudflare Modes
 
