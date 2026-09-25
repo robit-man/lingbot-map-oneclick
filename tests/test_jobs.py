@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import time
 import json
 import threading
+import time
 from pathlib import Path
 
 from webapp.jobs import JobManager
@@ -38,8 +38,12 @@ def test_job_manager_runs_and_persists_job(tmp_path: Path):
         manager.close()
 
 
-def test_job_manager_restores_complete_jobs_and_fails_interrupted_jobs(tmp_path: Path):
-    for job_id, status in (("finished", "complete"), ("interrupted", "running")):
+def test_job_manager_restores_terminal_jobs_and_resolves_interrupted_jobs(tmp_path: Path):
+    for job_id, status in (
+        ("finished", "complete"),
+        ("interrupted", "running"),
+        ("cancellation", "cancelling"),
+    ):
         job_dir = tmp_path / job_id
         job_dir.mkdir()
         (job_dir / "job.json").write_text(json.dumps({
@@ -62,6 +66,9 @@ def test_job_manager_restores_complete_jobs_and_fails_interrupted_jobs(tmp_path:
         interrupted = manager.get("interrupted")
         assert interrupted.status == "failed"
         assert "service restart" in interrupted.message
+        cancellation = manager.get("cancellation")
+        assert cancellation.status == "cancelled"
+        assert cancellation.cancellation_acknowledged_at is not None
     finally:
         manager.close()
 
@@ -77,20 +84,52 @@ class BlockingEngine:
         return {"frames_used": 2}
 
 
-def test_running_job_remains_cancelled_when_gpu_work_returns(tmp_path: Path):
+def test_running_job_remains_cancelling_until_gpu_work_returns(tmp_path: Path):
     engine = BlockingEngine()
     manager = JobManager(engine=engine, root=tmp_path, max_queue=2, retain_jobs=2)
     try:
         job = manager.submit("cancel-running", result_dir=tmp_path / "cancel-running" / "result")
         assert engine.started.wait(timeout=1)
         manager.cancel(job.id)
+        assert job.status == "cancelling"
+        assert job.cancellation_requested_at is not None
+        assert job.cancellation_acknowledged_at is None
         engine.release.set()
         deadline = time.monotonic() + 1
         while job.status != "cancelled" and time.monotonic() < deadline:
             time.sleep(0.01)
         assert job.status == "cancelled"
+        assert job.cancellation_acknowledged_at is not None
         persisted = json.loads((tmp_path / job.id / "job.json").read_text(encoding="utf-8"))
         assert persisted["status"] == "cancelled"
     finally:
         engine.release.set()
+        manager.close()
+
+
+class FinalizationRaceManager(JobManager):
+    """Inject a cancellation at the final checkpoint/update boundary."""
+
+    def _update(self, job, **changes):
+        if changes.get("status") == "complete":
+            self.cancel(job.id)
+        return super()._update(job, **changes)
+
+
+def test_cancellation_racing_result_promotion_reaches_terminal_state(tmp_path: Path):
+    manager = FinalizationRaceManager(
+        engine=FakeEngine(), root=tmp_path, max_queue=2, retain_jobs=2
+    )
+    try:
+        job = manager.submit(
+            "cancel-finalize",
+            result_dir=tmp_path / "cancel-finalize" / "result",
+        )
+        deadline = time.monotonic() + 2
+        while job.status not in {"cancelled", "failed"} and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert job.status == "cancelled"
+        assert job.cancellation_acknowledged_at is not None
+        assert not (tmp_path / job.id / "result").exists()
+    finally:
         manager.close()

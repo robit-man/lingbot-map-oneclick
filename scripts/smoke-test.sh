@@ -25,6 +25,7 @@ set +a
 base_url="${1:-http://127.0.0.1:${LINGBOT_PORT:-8080}}"
 video_path="${temporary_dir}/walkaround.mp4"
 result_path="${temporary_dir}/reconstruction.glb"
+point_cloud_path="${temporary_dir}/point-cloud-lod.ply"
 deadline=$((SECONDS + ${LINGBOT_SMOKE_TIMEOUT:-1800}))
 
 curl -fsS "${base_url}/readyz" >/dev/null
@@ -40,45 +41,75 @@ docker run --rm \
   -c:v libx264 -pix_fmt yuv420p -movflags +faststart -y /output/walkaround.mp4
 
 printf 'smoke: uploading video (%s bytes)\n' "$(stat -c %s "${video_path}")"
+manifest="$("${python_bin}" -c '
+import json
+print(json.dumps({
+  "schema": "noclip.lingbot.request/1.0",
+  "captureSessionId": "smoke-contract",
+  "coordinateSystem": {
+    "geodetic": "WGS84", "localFrame": "ENU",
+    "cameraAxes": "opencv_x_right_y_down_z_forward",
+    "quaternionOrder": "xyzw", "units": "meters"
+  },
+  "media": [], "poses": [],
+  "options": {"videoFps": 4, "maxFrames": 8, "numScaleFrames": 2,
+              "keyframeInterval": 2, "confidencePercentile": 50,
+              "includeCameras": False}
+}))
+')"
 response="$(curl -fsS \
   -H "Authorization: Bearer ${LINGBOT_API_TOKEN}" \
-  -F "files=@${video_path};type=video/mp4" \
-  -F fps=4 \
-  -F max_frames=8 \
-  -F num_scale_frames=2 \
-  -F keyframe_interval=2 \
-  -F confidence_percentile=50 \
-  -F include_cameras=true \
-  "${base_url}/api/jobs")"
-job_id="$(printf '%s' "${response}" | "${python_bin}" -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+  -H "Idempotency-Key: smoke-$(date +%s)" \
+  -F "media=@${video_path};type=video/mp4" \
+  -F "manifest=${manifest}" \
+  "${base_url}/v1/reconstructions")"
+job_id="$(printf '%s' "${response}" | "${python_bin}" -c 'import json,sys; print(json.load(sys.stdin)["jobId"])')"
 printf 'smoke: job %s queued\n' "${job_id}"
 
 last_message=""
 while (( SECONDS < deadline )); do
   response="$(curl -fsS \
     -H "Authorization: Bearer ${LINGBOT_API_TOKEN}" \
-    "${base_url}/api/jobs/${job_id}")"
+    "${base_url}/v1/reconstructions/${job_id}")"
   IFS=$'\t' read -r status progress message < <(
     printf '%s' "${response}" | "${python_bin}" -c '
 import json
 import sys
 job = json.load(sys.stdin)
 message = str(job.get("message", "")).replace("\t", " ").replace("\n", " ")
-print(job["status"], job.get("progress", 0), message, sep="\t")
+print(job["status"], round(float(job.get("progress", 0)) * 100), message, sep="\t")
 '
   )
   if [[ "${message}" != "${last_message}" ]]; then
     printf 'smoke: %3s%% %s\n' "${progress}" "${message}"
     last_message="${message}"
   fi
-  if [[ "${status}" == "complete" ]]; then
-    result_url="$(printf '%s' "${response}" | "${python_bin}" -c 'import json,sys; print(json.load(sys.stdin)["result_url"])')"
+  if [[ "${status}" == "completed" ]]; then
+    response="$(curl -fsS \
+      -H "Authorization: Bearer ${LINGBOT_API_TOKEN}" \
+      "${base_url}/v1/reconstructions/${job_id}/result")"
+    readarray -t artifact_urls < <(printf '%s' "${response}" | "${python_bin}" -c '
+import json,sys
+artifacts = {item["kind"]: item["url"] for item in json.load(sys.stdin)["artifacts"]}
+required = {"reconstruction_glb", "point_cloud", "trajectory", "manifest", "confidence"}
+assert required <= artifacts.keys(), sorted(artifacts)
+print(artifacts["reconstruction_glb"])
+print(artifacts["point_cloud"])
+')
     curl -fsS \
       -H "Authorization: Bearer ${LINGBOT_API_TOKEN}" \
-      "${base_url}${result_url}" \
+      "${base_url}${artifact_urls[0]}" \
       -o "${result_path}"
+    curl -fsS \
+      -H "Authorization: Bearer ${LINGBOT_API_TOKEN}" \
+      "${base_url}${artifact_urls[1]}" \
+      -o "${point_cloud_path}"
     [[ "$(head -c 4 "${result_path}")" == "glTF" ]] || {
       printf 'error: reconstruction is not a binary GLB\n' >&2
+      exit 1
+    }
+    [[ "$(head -c 3 "${point_cloud_path}")" == "ply" ]] || {
+      printf 'error: point-cloud LOD is not a PLY artifact\n' >&2
       exit 1
     }
     geometry_count="$(docker run --rm \
@@ -86,8 +117,9 @@ print(job["status"], job.get("progress", 0), message, sep="\t")
       -v "${result_path}:/result.glb:ro" \
       lingbot-map-web:local \
       -c 'import trimesh; scene=trimesh.load("/result.glb"); count=len(scene.geometry); assert count; print(count)')"
-    printf 'smoke: PASS — browser-ready GLB is %s bytes with %s geometries\n' \
-      "$(stat -c %s "${result_path}")" "${geometry_count}"
+    printf 'smoke: PASS — GLB is %s bytes with %s geometries; PLY LOD is %s bytes\n' \
+      "$(stat -c %s "${result_path}")" "${geometry_count}" \
+      "$(stat -c %s "${point_cloud_path}")"
     exit 0
   fi
   if [[ "${status}" == "failed" ]]; then

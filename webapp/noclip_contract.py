@@ -12,6 +12,20 @@ NOCLIP_REQUEST_SCHEMA = "noclip.lingbot.request/1.0"
 NOCLIP_RESULT_SCHEMA = "noclip.lingbot.result/1.0"
 
 
+def exported_model_transform(predictions: dict[str, Any]) -> np.ndarray:
+    """Return the transform applied to both GLB geometry and solved cameras."""
+
+    extrinsics = np.asarray(predictions.get("extrinsic"), dtype=np.float64)
+    if extrinsics.ndim != 3 or extrinsics.shape[1:] != (3, 4) or not len(extrinsics):
+        raise ValueError("LingBot predictions are missing [frames,3,4] extrinsics")
+    first = np.eye(4, dtype=np.float64)
+    first[:3, :4] = extrinsics[0]
+    opengl = np.diag([1.0, -1.0, -1.0, 1.0])
+    align_y_180 = np.eye(4, dtype=np.float64)
+    align_y_180[:3, :3] = Rotation.from_euler("y", 180, degrees=True).as_matrix()
+    return np.linalg.inv(first) @ opengl @ align_y_180
+
+
 def validate_noclip_manifest(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("schema") != NOCLIP_REQUEST_SCHEMA:
         raise ValueError(f"manifest schema must be {NOCLIP_REQUEST_SCHEMA}")
@@ -94,10 +108,7 @@ def build_aligned_camera_frames(
 
     full = np.repeat(np.eye(4, dtype=np.float64)[None, ...], len(extrinsics), axis=0)
     full[:, :3, :4] = extrinsics
-    opengl = np.diag([1.0, -1.0, -1.0, 1.0])
-    align_y_180 = np.eye(4, dtype=np.float64)
-    align_y_180[:3, :3] = Rotation.from_euler("y", 180, degrees=True).as_matrix()
-    scene_alignment = np.linalg.inv(full[0]) @ opengl @ align_y_180
+    scene_alignment = exported_model_transform(predictions)
 
     frames: list[dict[str, Any]] = []
     for index, world_to_camera in enumerate(full):

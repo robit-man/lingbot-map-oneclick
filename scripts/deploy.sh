@@ -56,6 +56,7 @@ load_env() {
   export LINGBOT_DEPLOYMENT_MODE="${LINGBOT_DEPLOYMENT_MODE:-public}"
   export LINGBOT_VRAM_MIB="${LINGBOT_VRAM_MIB:-32768}"
   export LINGBOT_READY_TIMEOUT="${LINGBOT_READY_TIMEOUT:-1800}"
+  export LINGBOT_EXPECTED_DURATION="${LINGBOT_EXPECTED_DURATION:-86400}"
   if [[ "${LINGBOT_DEPLOYMENT_MODE}" != "public" && "${LINGBOT_DEPLOYMENT_MODE}" != "internal" ]]; then
     printf 'LINGBOT_DEPLOYMENT_MODE must be public or internal\n' >&2
     return 2
@@ -135,6 +136,8 @@ run_foreground() {
   export CUDA_VISIBLE_DEVICES="${gpu_uuid}"
   docker gpu run \
     --owner lingbot-map \
+    --justification "NOCLIP LingBot reconstruction provider" \
+    --expected-duration "${LINGBOT_EXPECTED_DURATION}" \
     --vram-mib "${LINGBOT_VRAM_MIB}" \
     --gpu "${gpu_uuid}" \
     --ready-timeout "${LINGBOT_READY_TIMEOUT}" \

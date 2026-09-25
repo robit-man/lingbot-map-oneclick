@@ -42,6 +42,7 @@ class Settings:
     max_frames: int
     max_queue: int
     retain_jobs: int
+    point_cloud_max_points: int
     image_size: int
     patch_size: int
     max_frame_num: int
@@ -101,6 +102,9 @@ class Settings:
             max_frames=_env_int("LINGBOT_MAX_FRAMES", 96, minimum=2),
             max_queue=_env_int("LINGBOT_MAX_QUEUE", 4),
             retain_jobs=_env_int("LINGBOT_RETAIN_JOBS", 20),
+            point_cloud_max_points=_env_int(
+                "LINGBOT_POINT_CLOUD_MAX_POINTS", 250_000, minimum=1_000
+            ),
             image_size=_env_int("LINGBOT_IMAGE_SIZE", 518),
             patch_size=_env_int("LINGBOT_PATCH_SIZE", 14),
             max_frame_num=_env_int("LINGBOT_MAX_FRAME_NUM", 1024),

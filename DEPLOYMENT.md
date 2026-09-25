@@ -59,6 +59,8 @@ available for an explicit UUID constraint, but the index and UUID selectors are
 mutually exclusive. Leave both blank (or set the index to `auto`) to select the
 broker-eligible GPU with the most current headroom. The app also calls `prepare`
 before each inference burst and `ready` after CUDA memory stabilizes.
+Every lease records owner `lingbot-map`, the NOCLIP reconstruction purpose, and
+the operator-configurable `LINGBOT_EXPECTED_DURATION` (default 86400 seconds).
 
 ## Cloudflare Modes
 
@@ -111,12 +113,35 @@ The NOCLIP contract endpoints are:
 - `GET /v1/reconstructions/{jobId}/result`
 - `GET /v1/reconstructions/{jobId}/artifacts/{fileName}`
 
-All require `Authorization: Bearer <LINGBOT_API_TOKEN>`. Result payloads contain
-the reconstruction GLB, trajectory artifact, source media/sensor mapping,
-frame poses in the exported model frame, and measured inference seconds.
+All require `Authorization: Bearer <LINGBOT_API_TOKEN>`; the deprecated
+`X-API-Token` form is rejected. Submission also requires an `Idempotency-Key`.
+The key maps durably to one provider job, same-key/same-request replay returns
+that job, and conflicting reuse is rejected.
+
+Status responses report the durable stage and progress plus queue position,
+queue size, active/available capacity, and cancellation timestamps. Queued work
+can cancel immediately. Running work remains `cancelling` while an upstream
+model call is in flight, becomes `cancelled` only after CUDA cleanup, and has
+all partial result output removed before that terminal status is visible.
+Decoding, image preprocessing, GPU admission, postprocessing, export, and
+artifact finalization have cooperative checkpoints. The bounded upstream
+`inference_streaming` call itself cannot safely stop mid-call and is reported as
+such; cancellation is checked immediately when it returns.
+
+Completed NOCLIP results contain a normalized GLB, bounded binary-PLY
+point-cloud LOD, solved trajectory, per-frame intrinsics, confidence/quality
+diagnostics, and `noclip.lingbot.reconstruction/1.0` manifest. They all declare
+the `exported_lingbot_model` frame and the manifest records the exact transform
+convention and SHA-256/size metadata. The LOD is capped by
+`LINGBOT_POINT_CLOUD_MAX_POINTS` (default 250000). Confidence filtering remains
+enabled; sky masking remains disabled until a representative outdoor field
+corpus demonstrates an accuracy benefit.
+
 Persisted completed/failed/cancelled job records are reloaded after restart;
-queued/running records are made terminal with an interruption reason so the
-NOCLIP backend never polls a vanished job indefinitely.
+staging/queued/running records become explicit restart failures, while an
+interrupted cancellation becomes acknowledged. Upload and decoded-frame
+temporaries are removed at terminal completion; retained durable artifacts are
+bounded by `LINGBOT_RETAIN_JOBS`.
 
 ## Operations
 
@@ -145,8 +170,8 @@ does not delete either directory.
 2. `/readyz` confirms the CUDA model is resident;
 3. a Quick Tunnel URL or configured named-tunnel URL is available.
 
-For a full video-to-GLB acceptance test using a short MP4 generated from the
-bundled loop scene:
+For a full authenticated NOCLIP acceptance using a short MP4 generated from the
+bundled loop scene, including GLB and point-cloud contract validation:
 
 ```bash
 ./run.sh smoke
@@ -157,6 +182,10 @@ For source-level validation before launch:
 ```bash
 ./run.sh test
 ```
+
+The direct source gates are `pytest -q`, `python3 -m pytest -q`,
+`python3 -m compileall -q webapp tests`, and `bash -n run.sh scripts/*.sh`.
+Plain `pytest` resolves the repository packages without a manual `PYTHONPATH`.
 
 ## Video workflow
 

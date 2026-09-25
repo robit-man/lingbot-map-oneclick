@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
 import shutil
 import uuid
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from typing import Annotated
 
@@ -19,10 +21,9 @@ from .engine import InferenceEngine
 from .inputs import (
     IMAGE_SUFFIXES,
     VIDEO_SUFFIXES,
-    extract_video_frames,
-    validate_image_files,
+    stage_input_media,
 )
-from .jobs import JobManager, QueueFullError
+from .jobs import JobManager, QueueFullError, ReconstructionCancelled
 from .noclip_contract import (
     NOCLIP_REQUEST_SCHEMA,
     NOCLIP_RESULT_SCHEMA,
@@ -43,6 +44,7 @@ async def _save_uploads(
     *,
     byte_limit: int,
     file_limit: int,
+    cancellation_checkpoint=None,
 ) -> list[Path]:
     if not 1 <= len(uploads) <= file_limit:
         raise HTTPException(400, f"upload between 1 and {file_limit} files")
@@ -57,6 +59,8 @@ async def _save_uploads(
             target = destination / f"{index:06d}{suffix}"
             with target.open("wb") as handle:
                 while chunk := await upload.read(1024 * 1024):
+                    if cancellation_checkpoint is not None:
+                        cancellation_checkpoint()
                     total += len(chunk)
                     if total > byte_limit:
                         raise HTTPException(
@@ -72,9 +76,13 @@ async def _save_uploads(
     return saved
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    engine_override: InferenceEngine | None = None,
+) -> FastAPI:
     settings = settings or Settings.from_env()
-    engine = InferenceEngine(settings)
+    engine = engine_override or InferenceEngine(settings)
     manager: JobManager | None = None
 
     @asynccontextmanager
@@ -119,13 +127,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def require_token(
         authorization: Annotated[str | None, Header()] = None,
-        x_api_token: Annotated[str | None, Header()] = None,
     ) -> None:
         bearer = ""
         if authorization and authorization.lower().startswith("bearer "):
             bearer = authorization[7:].strip()
-        supplied = bearer or (x_api_token or "")
-        if not supplied or not hmac.compare_digest(supplied, settings.api_token):
+        if not bearer or not hmac.compare_digest(bearer, settings.api_token):
             raise HTTPException(
                 401,
                 "invalid access token",
@@ -155,6 +161,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "frames": settings.max_frames,
                 "queue": settings.max_queue,
             },
+            "capacity": manager.capacity() if manager is not None else None,
         }
 
     @application.post("/api/jobs", dependencies=[auth], status_code=202)
@@ -179,16 +186,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(400, "keyframe_interval must be between 1 and 16")
         if not 0 <= confidence_percentile <= 95:
             raise HTTPException(400, "confidence_percentile must be between 0 and 95")
+        if manager is None:
+            raise HTTPException(503, "job manager is not ready")
 
         job_id = uuid.uuid4().hex
         job_dir = settings.jobs_dir / job_id
         upload_dir = job_dir / "upload"
         try:
+            manager.reserve(job_id, contract="browser")
             uploaded = await _save_uploads(
                 files,
                 upload_dir,
                 byte_limit=settings.max_upload_bytes,
                 file_limit=settings.max_files,
+                cancellation_checkpoint=lambda: manager.cancellation_checkpoint(job_id),
             )
             image_uploads = [path for path in uploaded if path.suffix in IMAGE_SUFFIXES]
             video_uploads = [path for path in uploaded if path.suffix in VIDEO_SUFFIXES]
@@ -196,54 +207,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(400, "upload either one video or an image sequence")
             if len(video_uploads) > 1:
                 raise HTTPException(400, "upload only one video")
-
-            image_dir = job_dir / "frames"
-            if video_uploads:
-                _paths, input_summary = await asyncio.to_thread(
-                    extract_video_frames,
-                    video_uploads[0],
-                    image_dir,
+            if not video_uploads and len(image_uploads) < 2:
+                raise HTTPException(400, "upload at least two images")
+            job = manager.enqueue(
+                job_id,
+                preprocessor=partial(
+                    stage_input_media,
+                    uploaded,
+                    job_dir / "frames",
                     fps=fps,
                     max_frames=max_frames,
-                )
-            else:
-                if len(image_uploads) < 2:
-                    raise HTTPException(400, "upload at least two images")
-                selected = image_uploads[:max_frames]
-                await asyncio.to_thread(validate_image_files, selected)
-                image_dir.mkdir(parents=True, exist_ok=True)
-                for index, source in enumerate(selected):
-                    source.replace(image_dir / f"{index:06d}{source.suffix}")
-                input_summary = {
-                    "input_mode": "images",
-                    "frames_used": len(selected),
-                }
-
-            if manager is None:
-                raise HTTPException(503, "job manager is not ready")
-            job = manager.submit(
-                job_id,
-                contract="browser",
-                image_dir=image_dir,
+                ),
                 result_dir=job_dir / "result",
                 num_scale_frames=num_scale_frames,
                 keyframe_interval=keyframe_interval,
                 confidence_percentile=confidence_percentile,
                 include_cameras=include_cameras,
-                input_summary=input_summary,
             )
-            return job.public()
+            return manager.public(job.id)
         except QueueFullError as exc:
             shutil.rmtree(job_dir, ignore_errors=True)
             raise HTTPException(429, str(exc)) from exc
+        except ReconstructionCancelled as exc:
+            manager.fail_reserved(job_id, "Cancellation acknowledged during upload")
+            raise HTTPException(409, "upload was cancelled") from exc
         except HTTPException:
-            shutil.rmtree(job_dir, ignore_errors=True)
+            manager.fail_reserved(job_id, "Browser upload validation failed")
             raise
         except ValueError as exc:
-            shutil.rmtree(job_dir, ignore_errors=True)
+            manager.fail_reserved(job_id, f"Browser upload validation failed: {exc}")
             raise HTTPException(400, str(exc)) from exc
         except Exception:
-            shutil.rmtree(job_dir, ignore_errors=True)
+            manager.fail_reserved(job_id, "Browser upload staging failed")
             LOGGER.exception("failed to stage job %s", job_id)
             raise HTTPException(500, "could not stage the upload")
 
@@ -251,10 +246,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def job_status(job_id: str):
         if manager is None:
             raise HTTPException(503, "job manager is not ready")
-        job = manager.get(job_id)
-        if job is None:
+        payload = manager.public(job_id)
+        if payload is None:
             raise HTTPException(404, "job not found")
-        return job.public()
+        return payload
 
     @application.get("/api/jobs/{job_id}/result", dependencies=[auth])
     async def job_result(job_id: str):
@@ -288,6 +283,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def create_noclip_reconstruction(
         media: Annotated[list[UploadFile], File()],
         manifest: Annotated[str, Form()],
+        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
         model: Annotated[str | None, Form()] = None,
         revision: Annotated[str | None, Form()] = None,
     ):
@@ -303,14 +299,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(409, "requested model is not resident on this worker")
         if requested_revision != settings.model_revision:
             raise HTTPException(409, "requested revision is not resident on this worker")
-        job_id = uuid.uuid4().hex
+        if not 8 <= len(idempotency_key) <= 200 or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:"
+            for character in idempotency_key
+        ):
+            raise HTTPException(400, "Idempotency-Key is invalid")
+        if manager is None:
+            raise HTTPException(503, "job manager is not ready")
+        job_id = hashlib.sha256(
+            f"noclip.lingbot:{idempotency_key}".encode("utf-8")
+        ).hexdigest()
+        request_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "manifest": manifest_data,
+                    "model": requested_model,
+                    "revision": requested_revision,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         job_dir = settings.jobs_dir / job_id
         try:
+            _job, created = manager.reserve(
+                job_id,
+                contract=NOCLIP_REQUEST_SCHEMA,
+                request_fingerprint=request_fingerprint,
+            )
+            if not created:
+                payload = manager.public(job_id) or {}
+                return {
+                    "jobId": job_id,
+                    "status": payload.get("status", "failed"),
+                    "stage": payload.get("stage", "failed"),
+                    "queuePosition": payload.get("queuePosition"),
+                    "queueSize": payload.get("queueSize", 0),
+                    "activeCapacity": payload.get("activeCapacity", 1),
+                    "availableCapacity": payload.get("availableCapacity", 0),
+                    "idempotentReplay": True,
+                }
             uploaded = await _save_uploads(
                 media,
                 job_dir / "upload",
                 byte_limit=settings.max_upload_bytes,
                 file_limit=settings.max_files,
+                cancellation_checkpoint=lambda: manager.cancellation_checkpoint(job_id),
             )
             image_uploads = [path for path in uploaded if path.suffix in IMAGE_SUFFIXES]
             video_uploads = [path for path in uploaded if path.suffix in VIDEO_SUFFIXES]
@@ -324,30 +358,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 max(2, int(options.get("maxFrames", settings.max_frames))),
             )
             fps = min(30, max(1, int(options.get("videoFps", 8))))
-            image_dir = job_dir / "frames"
-            if video_uploads:
-                _paths, input_summary = await asyncio.to_thread(
-                    extract_video_frames,
-                    video_uploads[0],
-                    image_dir,
+            if not video_uploads and len(image_uploads) < 2:
+                raise HTTPException(400, "upload at least two images")
+            job = manager.enqueue(
+                job_id,
+                preprocessor=partial(
+                    stage_input_media,
+                    uploaded,
+                    job_dir / "frames",
                     fps=fps,
                     max_frames=max_frames,
-                )
-            else:
-                if len(image_uploads) < 2:
-                    raise HTTPException(400, "upload at least two images")
-                selected = image_uploads[:max_frames]
-                await asyncio.to_thread(validate_image_files, selected)
-                image_dir.mkdir(parents=True, exist_ok=True)
-                for index, source in enumerate(selected):
-                    source.replace(image_dir / f"{index:06d}{source.suffix}")
-                input_summary = {"input_mode": "images", "frames_used": len(selected)}
-            if manager is None:
-                raise HTTPException(503, "job manager is not ready")
-            job = manager.submit(
-                job_id,
-                contract=NOCLIP_REQUEST_SCHEMA,
-                image_dir=image_dir,
+                    summary_metadata={
+                        "model": settings.model_repo,
+                        "revision": settings.model_revision,
+                    },
+                ),
                 result_dir=job_dir / "result",
                 num_scale_frames=min(
                     8, max(1, int(options.get("numScaleFrames", settings.default_scale_frames)))
@@ -359,25 +384,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     95.0, max(0.0, float(options.get("confidencePercentile", 50.0)))
                 ),
                 include_cameras=bool(options.get("includeCameras", False)),
-                input_summary={
-                    **input_summary,
-                    "model": settings.model_repo,
-                    "revision": settings.model_revision,
-                },
                 noclip_manifest=manifest_data,
             )
-            return {"jobId": job.id, "status": "queued"}
+            payload = manager.public(job.id) or {}
+            return {
+                "jobId": job.id,
+                "status": payload.get("status", "queued"),
+                "stage": payload.get("stage", "provider_queued"),
+                "queuePosition": payload.get("queuePosition"),
+                "queueSize": payload.get("queueSize", 0),
+                "activeCapacity": payload.get("activeCapacity", 1),
+                "availableCapacity": payload.get("availableCapacity", 0),
+                "estimatedWaitMinSeconds": payload.get("estimatedWaitMinSeconds"),
+                "estimatedWaitMaxSeconds": payload.get("estimatedWaitMaxSeconds"),
+                "idempotentReplay": False,
+            }
         except QueueFullError as exc:
             shutil.rmtree(job_dir, ignore_errors=True)
             raise HTTPException(429, str(exc)) from exc
+        except ReconstructionCancelled as exc:
+            manager.fail_reserved(job_id, "Cancellation acknowledged during upload")
+            raise HTTPException(409, "reconstruction upload was cancelled") from exc
         except HTTPException:
-            shutil.rmtree(job_dir, ignore_errors=True)
+            manager.fail_reserved(job_id, "Provider input validation failed")
             raise
         except (TypeError, ValueError) as exc:
-            shutil.rmtree(job_dir, ignore_errors=True)
+            manager.fail_reserved(job_id, f"Provider input validation failed: {exc}")
             raise HTTPException(400, str(exc)) from exc
         except Exception:
-            shutil.rmtree(job_dir, ignore_errors=True)
+            manager.fail_reserved(job_id, "Provider input staging failed")
             LOGGER.exception("failed to stage NOCLIP job %s", job_id)
             raise HTTPException(500, "could not stage the reconstruction")
 
@@ -388,16 +423,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         job = manager.get(job_id)
         if job is None or job.contract != NOCLIP_REQUEST_SCHEMA:
             raise HTTPException(404, "reconstruction not found")
+        payload = manager.public(job_id) or {}
         status = {"complete": "completed", "running": "processing"}.get(
             job.status, job.status
         )
         return {
             "jobId": job.id,
             "status": status,
-            "stage": "ready" if status == "completed" else status,
+            "stage": payload.get("stage", "ready" if status == "completed" else status),
             "progress": job.progress / 100,
             "message": job.message,
             "metrics": job.summary or {},
+            "queuePosition": payload.get("queuePosition"),
+            "queueSize": payload.get("queueSize", 0),
+            "activeJobs": payload.get("activeJobs", 0),
+            "activeCapacity": payload.get("activeCapacity", 1),
+            "availableCapacity": payload.get("availableCapacity", 0),
+            "estimatedWaitMinSeconds": payload.get("estimatedWaitMinSeconds"),
+            "estimatedWaitMaxSeconds": payload.get("estimatedWaitMaxSeconds"),
+            "cancellationRequestedAt": job.cancellation_requested_at,
+            "cancellationAcknowledgedAt": job.cancellation_acknowledged_at,
         }
 
     @application.delete("/v1/reconstructions/{job_id}", dependencies=[auth], status_code=202)
@@ -407,9 +452,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         job = manager.get(job_id)
         if job is None or job.contract != NOCLIP_REQUEST_SCHEMA:
             raise HTTPException(404, "reconstruction not found")
-        if job.status in {"queued", "running"}:
+        if job.status in JobManager.ACTIVE_STATUSES:
             manager.cancel(job_id)
-        return {"jobId": job.id, "status": job.status}
+        current = manager.get(job_id) or job
+        return {
+            "jobId": current.id,
+            "status": current.status,
+            "stage": current.stage,
+            "cancellationRequestedAt": current.cancellation_requested_at,
+            "cancellationAcknowledgedAt": current.cancellation_acknowledged_at,
+        }
 
     @application.get("/v1/reconstructions/{job_id}/result", dependencies=[auth])
     async def noclip_reconstruction_result(job_id: str):
@@ -421,42 +473,95 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if job.status != "complete":
             raise HTTPException(409, f"reconstruction is {job.status}")
         result_dir = settings.jobs_dir / job_id / "result"
-        summary_path = result_dir / "summary.json"
-        trajectory_path = result_dir / "trajectory.json"
-        if not summary_path.is_file() or not trajectory_path.is_file():
+        paths = {
+            "glb": result_dir / "reconstruction.glb",
+            "summary": result_dir / "summary.json",
+            "trajectory": result_dir / "trajectory.json",
+            "pointCloud": result_dir / "point-cloud-lod.ply",
+            "intrinsics": result_dir / "intrinsics.json",
+            "diagnostics": result_dir / "quality-diagnostics.json",
+            "manifest": result_dir / "reconstruction-manifest.json",
+        }
+        if any(not paths[name].is_file() for name in ("glb", "summary", "trajectory")):
             raise HTTPException(500, "reconstruction contract artifacts are incomplete")
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+        summary = json.loads(paths["summary"].read_text(encoding="utf-8"))
+        trajectory = json.loads(paths["trajectory"].read_text(encoding="utf-8"))
         base = f"/v1/reconstructions/{job_id}/artifacts"
-        return {
-            "schema": NOCLIP_RESULT_SCHEMA,
-            "artifacts": [
+        artifacts = [
+            {
+                "kind": "reconstruction_glb",
+                "url": f"{base}/reconstruction.glb",
+                "fileName": "reconstruction.glb",
+                "mimeType": "model/gltf-binary",
+                "metadata": {
+                    "framesUsed": summary.get("frames_used"),
+                    "inferenceSeconds": summary.get("inference_seconds"),
+                    "resultBytes": summary.get("result_bytes"),
+                },
+            },
+            {
+                "kind": "trajectory",
+                "url": f"{base}/trajectory.json",
+                "fileName": "trajectory.json",
+                "mimeType": "application/json",
+                "metadata": {"frameCount": len(trajectory.get("frames") or [])},
+            },
+        ]
+        if paths["pointCloud"].is_file():
+            artifacts.append(
                 {
-                    "kind": "reconstruction_glb",
-                    "url": f"{base}/reconstruction.glb",
-                    "fileName": "reconstruction.glb",
-                    "mimeType": "model/gltf-binary",
+                    "kind": "point_cloud",
+                    "url": f"{base}/point-cloud-lod.ply",
+                    "fileName": "point-cloud-lod.ply",
+                    "mimeType": "application/octet-stream",
                     "metadata": {
-                        "framesUsed": summary.get("frames_used"),
-                        "inferenceSeconds": summary.get("inference_seconds"),
-                        "resultBytes": summary.get("result_bytes"),
+                        "points": summary.get("point_cloud_lod_points"),
+                        "bytes": summary.get("point_cloud_lod_bytes"),
+                        "coordinateFrame": "exported_lingbot_model",
                     },
-                },
+                }
+            )
+        if paths["manifest"].is_file():
+            reconstruction_manifest = json.loads(
+                paths["manifest"].read_text(encoding="utf-8")
+            )
+            artifacts.append(
                 {
-                    "kind": "trajectory",
-                    "url": f"{base}/trajectory.json",
-                    "fileName": "trajectory.json",
+                    "kind": "manifest",
+                    "url": f"{base}/reconstruction-manifest.json",
+                    "fileName": "reconstruction-manifest.json",
                     "mimeType": "application/json",
-                    "metadata": {"frameCount": len(trajectory.get("frames") or [])},
-                },
+                    "metadata": {
+                        "schema": reconstruction_manifest.get("schema"),
+                        "coordinateContract": reconstruction_manifest.get(
+                            "coordinateContract", {}
+                        ),
+                    },
+                }
+            )
+        else:
+            artifacts.append(
                 {
                     "kind": "manifest",
                     "url": f"{base}/summary.json",
                     "fileName": "summary.json",
                     "mimeType": "application/json",
-                    "metadata": {},
-                },
-            ],
+                    "metadata": {"legacy": True},
+                }
+            )
+        if paths["diagnostics"].is_file():
+            artifacts.append(
+                {
+                    "kind": "confidence",
+                    "url": f"{base}/quality-diagnostics.json",
+                    "fileName": "quality-diagnostics.json",
+                    "mimeType": "application/json",
+                    "metadata": {"schema": "noclip.lingbot.quality/1.0"},
+                }
+            )
+        return {
+            "schema": NOCLIP_RESULT_SCHEMA,
+            "artifacts": artifacts,
             "frames": trajectory.get("frames") or [],
             "summary": summary,
         }
@@ -471,12 +576,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if job is None or job.contract != NOCLIP_REQUEST_SCHEMA:
             raise HTTPException(404, "reconstruction not found")
         safe_name = Path(file_name).name
-        if safe_name not in {"reconstruction.glb", "trajectory.json", "summary.json"}:
+        if safe_name not in {
+            "reconstruction.glb",
+            "point-cloud-lod.ply",
+            "trajectory.json",
+            "intrinsics.json",
+            "quality-diagnostics.json",
+            "reconstruction-manifest.json",
+            "summary.json",
+        }:
             raise HTTPException(404, "artifact not found")
         path = settings.jobs_dir / job_id / "result" / safe_name
         if not path.is_file():
             raise HTTPException(404, "artifact not found")
-        media_type = "model/gltf-binary" if path.suffix == ".glb" else "application/json"
+        media_type = {
+            ".glb": "model/gltf-binary",
+            ".ply": "application/octet-stream",
+        }.get(path.suffix, "application/json")
         return FileResponse(path, media_type=media_type, filename=safe_name)
 
     assets = settings.web_dist / "assets"

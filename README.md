@@ -57,7 +57,9 @@ GPU placement is broker scoped. Set `LINGBOT_GPU_INDEX=1` in `.env` to pin the
 service to GPU 1; startup resolves the index to an eligible UUID and exposes
 only that exact UUID to the container. An explicit `LINGBOT_GPU_UUID` is also
 supported, and leaving both selectors blank preserves automatic headroom-based
-placement.
+placement. Broker leases include visible owner, purpose, and expected-duration
+metadata; the service calls `prepare` before inference growth and `ready` after
+CUDA cleanup.
 
 ### NOCLIP grounded reconstruction API
 
@@ -73,14 +75,21 @@ LINGBOT_MAP_SERVICE_TOKEN=<same value as LINGBOT_API_TOKEN>
 ```
 
 The bearer-protected `POST /v1/reconstructions` accepts ordered image/video
-media plus an exact `noclip.lingbot.request/1.0` manifest. The worker validates
-WGS84 + ENU + OpenCV axes + `xyzw`, reconstructs the GLB, and emits
-`trajectory.json` in the exact local coordinate frame used by that GLB. Status,
-result, artifact, and cancellation routes retain the same job ID across API
-restart; completed jobs remain readable and interrupted work becomes an
-explicit terminal failure for backend recovery. NOCLIP—not this GPU worker—is
-the owner of account authentication, holdings-derived daily quota admission,
-encrypted media storage, scan publication, and world-placement revisions.
+media, an exact `noclip.lingbot.request/1.0` manifest, and a required
+`Idempotency-Key`. The worker validates WGS84 + ENU + OpenCV axes + `xyzw` and
+returns one durable job for same-key replay. Status exposes queue/capacity,
+stage, progress, and honest `cancelling` versus acknowledged `cancelled` state.
+
+The result contract emits a normalized GLB, bounded point-cloud PLY LOD, solved
+trajectory, per-frame intrinsics, confidence/quality diagnostics, and one
+versioned reconstruction manifest. Every artifact uses the same
+`exported_lingbot_model` frame. Interrupted work is recovered explicitly after
+restart, partial cancelled output is never promoted, and provider upload/frame
+temporaries are cleaned at terminal completion. Confidence filtering remains
+enabled; sky masking is deliberately off until representative outdoor corpus
+evaluation supports enabling it. NOCLIP—not this GPU worker—is the owner of
+account authentication, holdings-derived daily quota admission, encrypted
+media storage, scan publication, and world-placement revisions.
 
 -----
 

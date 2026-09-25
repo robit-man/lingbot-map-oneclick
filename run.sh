@@ -204,7 +204,8 @@ start_supervised() {
 run_tests() {
   ensure_host_tools
   ensure_venv
-  "${venv_dir}/bin/python" -m pip install --disable-pip-version-check pytest Pillow
+  "${venv_dir}/bin/python" -m pip install --disable-pip-version-check \
+    pytest Pillow numpy scipy httpx -r "${project_dir}/deploy/requirements.txt"
   (
     cd "${project_dir}"
     "${venv_dir}/bin/python" -m pytest -q
