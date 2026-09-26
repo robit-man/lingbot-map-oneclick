@@ -20,12 +20,20 @@ This repository includes a broker-aware, single-GPU deployment with:
 The first start creates `.venv`, installs the lightweight checkpoint tooling,
 downloads the 4.63 GB model, builds the image and minified frontend, installs
 the pinned Cloudflared container, and starts the user service. The command waits
-for the CUDA model and tunnel before printing both access values:
+for the CUDA model and tunnel before printing non-secret access details. Retrieve
+the token only when provisioning a trusted client:
 
 ```bash
 ./run.sh url
 ./run.sh token
 ./run.sh verify
+```
+
+If a token is exposed, rotate it without printing the replacement, then copy
+the new value into trusted clients and restart the deployment:
+
+```bash
+./run.sh rotate-token
 ```
 
 The app is also bound locally at `http://127.0.0.1:8080`. The Cloudflare URL

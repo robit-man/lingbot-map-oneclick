@@ -13,7 +13,7 @@ usage() {
 Usage: ./run.sh [COMMAND]
 
 Commands:
-  start       Set up everything, start the supervised site, and print access details (default)
+  start       Set up everything, start the supervised site, and print non-secret access details (default)
   foreground Set up everything and keep the deployment attached to this terminal
   restart     Restart the supervised deployment and wait until it is ready
   stop        Stop the service and containers without deleting models or results
@@ -21,6 +21,7 @@ Commands:
   logs        Follow application and Cloudflared logs
   url         Print the active public URL
   token       Print the generated browser access token
+  rotate-token Replace the browser access token without printing it
   verify      Verify checkpoint integrity, model readiness, and the tunnel
   smoke       Upload a generated MP4 and verify a browser-ready 3D result
   test        Run source tests and build the minified browser app
@@ -181,7 +182,7 @@ wait_until_ready() {
         else
           printf '  Site:  %s\n' "${url}"
         fi
-        printf '  Token: %s\n' "$(${deploy_script} token)"
+        printf '  Authentication: bearer token configured; retrieve it explicitly with ./run.sh token\n'
         printf '  Local: http://127.0.0.1:%s\n' "${LINGBOT_PORT:-8080}"
         printf '\nDrop in one video, click “Build 3D map,” and the result opens in the site.\n'
         return 0
@@ -228,7 +229,7 @@ case "${command_name}" in
     systemctl --user stop lingbot-map.service 2>/dev/null || true
     "${deploy_script}" down
     ;;
-  status|logs|url|token|verify)
+  status|logs|url|token|rotate-token|verify)
     exec "${deploy_script}" "${command_name}"
     ;;
   smoke)

@@ -21,8 +21,24 @@ Commands:
   logs             Follow application and tunnel logs
   url              Print the active Quick Tunnel or configured public URL
   token            Print the generated browser/API token
+  rotate-token     Replace the browser/API token without printing it
   verify           Check model integrity, app readiness, and tunnel state
 USAGE
+}
+
+write_generated_token() {
+  local generated_token temporary_env
+  generated_token="$(openssl rand -hex 24)"
+  temporary_env="$(mktemp "${project_dir}/.env.XXXXXX")"
+  awk -v token="${generated_token}" '
+    BEGIN { replaced=0 }
+    /^LINGBOT_API_TOKEN=/ && !replaced { print "LINGBOT_API_TOKEN=" token; replaced=1; next }
+    { print }
+    END { if (!replaced) print "LINGBOT_API_TOKEN=" token }
+  ' "${env_file}" >"${temporary_env}"
+  chmod 600 "${temporary_env}"
+  mv "${temporary_env}" "${env_file}"
+  unset generated_token
 }
 
 ensure_env() {
@@ -31,17 +47,7 @@ ensure_env() {
     cp "${project_dir}/.env.example" "${env_file}"
   fi
   if ! awk -F= '$1 == "LINGBOT_API_TOKEN" && length($2) >= 24 { found=1 } END { exit !found }' "${env_file}"; then
-    local generated_token temporary_env
-    generated_token="$(openssl rand -hex 24)"
-    temporary_env="$(mktemp "${project_dir}/.env.XXXXXX")"
-    awk -v token="${generated_token}" '
-      BEGIN { replaced=0 }
-      /^LINGBOT_API_TOKEN=/ && !replaced { print "LINGBOT_API_TOKEN=" token; replaced=1; next }
-      { print }
-      END { if (!replaced) print "LINGBOT_API_TOKEN=" token }
-    ' "${env_file}" >"${temporary_env}"
-    chmod 600 "${temporary_env}"
-    mv "${temporary_env}" "${env_file}"
+    write_generated_token
   fi
   chmod 600 "${env_file}"
 }
@@ -221,6 +227,11 @@ show_token() {
   awk -F= '$1 == "LINGBOT_API_TOKEN" { print substr($0, index($0, "=") + 1); exit }' "${env_file}"
 }
 
+rotate_token() {
+  ensure_env
+  write_generated_token
+}
+
 verify_deployment() {
   load_env
   printf 'weight: '
@@ -250,6 +261,7 @@ case "${command_name}" in
   logs) show_logs ;;
   url) show_url ;;
   token) show_token ;;
+  rotate-token) rotate_token ;;
   verify) verify_deployment ;;
   -h|--help|help) usage ;;
   *) usage >&2; exit 2 ;;
