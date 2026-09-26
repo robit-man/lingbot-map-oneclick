@@ -26,6 +26,80 @@ def _images_as_rgb(predictions: dict[str, Any]) -> np.ndarray:
     return np.asarray(images, dtype=np.uint8)
 
 
+def _backproject_depth(predictions: dict[str, Any]) -> np.ndarray:
+    depth = np.asarray(predictions["depth"], dtype=np.float64)
+    if depth.ndim == 4 and depth.shape[-1] == 1:
+        depth = depth[..., 0]
+    extrinsics = np.asarray(predictions["extrinsic"], dtype=np.float64)
+    intrinsics = np.asarray(predictions["intrinsic"], dtype=np.float64)
+    if depth.ndim != 3:
+        raise ValueError("LingBot depth must have shape [frames,height,width]")
+    frame_count, height, width = depth.shape
+    if extrinsics.shape != (frame_count, 3, 4):
+        raise ValueError("LingBot depth and [frames,3,4] extrinsics do not match")
+    if intrinsics.shape != (frame_count, 3, 3):
+        raise ValueError("LingBot depth and [frames,3,3] intrinsics do not match")
+
+    pixel_x, pixel_y = np.meshgrid(
+        np.arange(width, dtype=np.float64),
+        np.arange(height, dtype=np.float64),
+        indexing="xy",
+    )
+    world_points = np.empty((frame_count, height, width, 3), dtype=np.float64)
+    for index in range(frame_count):
+        intrinsic = intrinsics[index]
+        if intrinsic[0, 0] == 0 or intrinsic[1, 1] == 0:
+            raise ValueError("LingBot intrinsics contain a zero focal length")
+        frame_depth = depth[index]
+        camera_points = np.stack(
+            (
+                (pixel_x - intrinsic[0, 2]) * frame_depth / intrinsic[0, 0],
+                (pixel_y - intrinsic[1, 2]) * frame_depth / intrinsic[1, 1],
+                frame_depth,
+                np.ones_like(frame_depth),
+            ),
+            axis=-1,
+        )
+        camera_to_world = np.eye(4, dtype=np.float64)
+        camera_to_world[:3, :4] = extrinsics[index]
+        camera_to_world = np.linalg.inv(camera_to_world)
+        world_points[index] = (camera_points @ camera_to_world.T)[..., :3]
+    return world_points
+
+
+def _dense_geometry(
+    predictions: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray, str]:
+    points_value = predictions.get("world_points")
+    if points_value is not None:
+        points = np.asarray(points_value, dtype=np.float64)
+        confidence_value = predictions.get("world_points_conf")
+        geometry_source = "world_points"
+    else:
+        points_value = predictions.get("world_points_from_depth")
+        if points_value is None:
+            required = ("depth", "extrinsic", "intrinsic")
+            missing = [key for key in required if predictions.get(key) is None]
+            if missing:
+                raise ValueError(
+                    "LingBot predictions have no point map and depth backprojection "
+                    f"is missing: {', '.join(missing)}"
+                )
+            points_value = _backproject_depth(predictions)
+        points = np.asarray(points_value, dtype=np.float64)
+        confidence_value = predictions.get("depth_conf")
+        geometry_source = "depth_backprojection"
+
+    if points.ndim != 4 or points.shape[-1] != 3:
+        raise ValueError("LingBot dense geometry must have shape [frames,height,width,3]")
+    confidence = (
+        np.asarray(confidence_value, dtype=np.float64)
+        if confidence_value is not None
+        else np.ones(points.shape[:-1], dtype=np.float64)
+    )
+    return points, confidence, geometry_source
+
+
 def write_point_cloud_lod(
     predictions: dict[str, Any],
     path: Path,
@@ -35,15 +109,7 @@ def write_point_cloud_lod(
 ) -> dict[str, Any]:
     """Write one deterministic bounded binary PLY in the exported GLB frame."""
 
-    points = np.asarray(predictions.get("world_points"), dtype=np.float64)
-    if points.ndim != 4 or points.shape[-1] != 3:
-        raise ValueError("LingBot predictions are missing point-map geometry")
-    confidence_value = predictions.get("world_points_conf")
-    confidence = (
-        np.asarray(confidence_value, dtype=np.float64)
-        if confidence_value is not None
-        else np.ones(points.shape[:-1], dtype=np.float64)
-    )
+    points, confidence, geometry_source = _dense_geometry(predictions)
     colors = _images_as_rgb(predictions)
     if confidence.shape != points.shape[:-1] or colors.shape[:-1] != points.shape[:-1]:
         raise ValueError("point, confidence, and color grids do not share one frame")
@@ -116,6 +182,7 @@ def write_point_cloud_lod(
         "maxPoints": int(max_points),
         "confidencePercentile": float(confidence_percentile),
         "confidenceThreshold": threshold,
+        "geometrySource": geometry_source,
         "boundingBoxM": {"minimum": lower, "maximum": upper},
     }
 
