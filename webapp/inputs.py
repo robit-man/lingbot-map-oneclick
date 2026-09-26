@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Callable
 
@@ -10,6 +11,36 @@ VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv"}
 
 CancellationCheckpoint = Callable[[], None]
 ProgressCallback = Callable[[int, str, str], None]
+
+
+def resolve_frame_presentation_timestamps(
+    decoded_timestamps_ms: list[float],
+    source_frame_indexes: list[int],
+    source_fps: float,
+) -> tuple[list[float], str, float]:
+    """Return bounded monotonic media times and an honest uncertainty label."""
+
+    decoder_is_valid = (
+        len(decoded_timestamps_ms) == len(source_frame_indexes)
+        and bool(decoded_timestamps_ms)
+        and all(math.isfinite(value) and value >= 0 for value in decoded_timestamps_ms)
+        and all(
+            decoded_timestamps_ms[index] > decoded_timestamps_ms[index - 1]
+            for index in range(1, len(decoded_timestamps_ms))
+        )
+    )
+    frame_period_ms = 1000.0 / max(1.0, source_fps)
+    if decoder_is_valid:
+        return (
+            [round(float(value), 3) for value in decoded_timestamps_ms],
+            "decoded-frame-pts",
+            round(max(1.0, frame_period_ms / 2), 3),
+        )
+    return (
+        [round(index * frame_period_ms, 3) for index in source_frame_indexes],
+        "source-fps-fallback",
+        round(frame_period_ms, 3),
+    )
 
 
 def validate_image_files(
@@ -58,6 +89,8 @@ def extract_video_frames(
     interval = max(1, round(source_fps / max(fps, 1)))
     frame_index = 0
     saved: list[Path] = []
+    decoded_timestamps_ms: list[float] = []
+    source_frame_indexes: list[int] = []
     try:
         while len(saved) < max_frames:
             if cancellation_checkpoint is not None:
@@ -70,6 +103,8 @@ def extract_video_frames(
                 if not cv2.imwrite(str(destination), frame):
                     raise RuntimeError(f"could not write extracted frame {destination.name}")
                 saved.append(destination)
+                decoded_timestamps_ms.append(float(capture.get(cv2.CAP_PROP_POS_MSEC)))
+                source_frame_indexes.append(frame_index)
                 if progress_callback is not None:
                     progress_callback(
                         min(28, 12 + round(16 * len(saved) / max_frames)),
@@ -82,6 +117,13 @@ def extract_video_frames(
 
     if len(saved) < 2:
         raise ValueError("the video must yield at least two frames")
+    frame_timestamps_ms, timestamp_association, timestamp_uncertainty_ms = (
+        resolve_frame_presentation_timestamps(
+            decoded_timestamps_ms,
+            source_frame_indexes,
+            source_fps,
+        )
+    )
     return saved, {
         "input_mode": "video",
         "source_fps": round(source_fps, 3),
@@ -89,6 +131,9 @@ def extract_video_frames(
         "sample_interval": interval,
         "original_frame_count": original_count,
         "frames_used": len(saved),
+        "frame_presentation_timestamps_ms": frame_timestamps_ms,
+        "frame_timestamp_association": timestamp_association,
+        "frame_timestamp_uncertainty_ms": timestamp_uncertainty_ms,
     }
 
 

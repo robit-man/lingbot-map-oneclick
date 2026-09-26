@@ -91,6 +91,14 @@ evaluation supports enabling it. NOCLIP—not this GPU worker—is the owner of
 account authentication, holdings-derived daily quota admission, encrypted
 media storage, scan publication, and world-placement revisions.
 
+For video, the solved trajectory uses presentation timestamps reported by the
+decoder so variable frame rate and dropped frames retain their actual media
+time. Each frame carries its monotonic capture time, nearest sensor sample, time
+source, nearest-sample delta, and uncertainty. If decoder PTS are missing or
+non-monotonic, the worker uses a source-FPS estimate and labels that fallback
+and its one-frame uncertainty explicitly; it never reports the estimate as a
+decoded timestamp.
+
 -----
 
 ### 🗺️ Meet LingBot-Map! We've built a feed-forward 3D foundation model for streaming 3D reconstruction! 🏗️🌍

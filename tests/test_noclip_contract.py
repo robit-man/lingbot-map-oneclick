@@ -58,3 +58,39 @@ def test_trajectory_uses_the_same_first_camera_alignment_as_glb_export():
     assert np.isclose(
         np.linalg.norm(frames[1]["cameraToWorld"]["positionM"]), 2.0
     )
+
+
+def test_video_frames_use_decoded_pts_instead_of_uniform_duration():
+    value = manifest()
+    value["media"] = [{
+        "sequenceNumber": 4,
+        "monotonicMs": 1_000.0,
+        "durationMs": 1_000.0,
+        "clockDiagnostics": {"mediaStartMs": 0.0},
+    }]
+    value["poses"] = [
+        {"sampleIndex": 10, "monotonicMs": 1_000.0},
+        {"sampleIndex": 11, "monotonicMs": 1_125.0},
+        {"sampleIndex": 12, "monotonicMs": 1_400.0},
+    ]
+    extrinsics = np.repeat(
+        np.array([[[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]]], dtype=np.float64),
+        3,
+        axis=0,
+    )
+    frames = build_aligned_camera_frames(
+        {"extrinsic": extrinsics},
+        value,
+        {
+            "frame_presentation_timestamps_ms": [0.0, 125.0, 400.0],
+            "frame_timestamp_association": "decoded-frame-pts",
+            "frame_timestamp_uncertainty_ms": 10.0,
+        },
+    )
+    assert [frame["monotonicMs"] for frame in frames] == [1_000.0, 1_125.0, 1_400.0]
+    assert [frame["sensorSampleIndex"] for frame in frames] == [10, 11, 12]
+    assert frames[1]["timeAssociation"] == {
+        "source": "decoded-frame-pts",
+        "uncertaintyMs": 10.0,
+        "sensorDeltaMs": 0.0,
+    }

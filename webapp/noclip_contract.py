@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -56,43 +57,103 @@ def _pose_for_frame(
     index: int,
     frame_count: int,
     manifest: dict[str, Any],
-) -> tuple[int, float | None, int]:
+    input_summary: dict[str, Any] | None = None,
+) -> tuple[int, float | None, int, dict[str, Any]]:
     poses = manifest.get("poses") or []
     media = manifest.get("media") or []
     target: float | None = None
     sequence_number = index
+    source = "unavailable"
+    uncertainty_ms: float | None = None
     if len(media) == frame_count and index < len(media):
         entry = media[index]
         sequence_number = int(entry.get("sequenceNumber", index))
         value = entry.get("monotonicMs")
         target = float(value) if isinstance(value, (int, float)) else None
+        source = str(entry.get("ptsAssociation") or "capture-callback-time")
+        clock = entry.get("clockDiagnostics") or {}
+        value = clock.get("uncertaintyMs")
+        uncertainty_ms = float(value) if isinstance(value, (int, float)) else None
     elif len(media) == 1:
         entry = media[0]
         sequence_number = int(entry.get("sequenceNumber", 0)) + index
         start = entry.get("monotonicMs")
         duration = entry.get("durationMs")
-        if isinstance(start, (int, float)) and isinstance(duration, (int, float)):
+        summary = input_summary or {}
+        decoded_timestamps = summary.get("frame_presentation_timestamps_ms")
+        declared_timestamps = entry.get("presentationTimestampsMs")
+        if (
+            isinstance(start, (int, float))
+            and isinstance(decoded_timestamps, list)
+            and len(decoded_timestamps) == frame_count
+            and isinstance(decoded_timestamps[index], (int, float))
+        ):
+            clock = entry.get("clockDiagnostics") or {}
+            media_start = clock.get("mediaStartMs", 0)
+            media_start = float(media_start) if isinstance(media_start, (int, float)) else 0.0
+            target = float(start) + float(decoded_timestamps[index]) - media_start
+            source = str(summary.get("frame_timestamp_association") or "decoded-frame-pts")
+            value = summary.get("frame_timestamp_uncertainty_ms")
+            uncertainty_ms = float(value) if isinstance(value, (int, float)) else None
+        elif (
+            isinstance(start, (int, float))
+            and isinstance(declared_timestamps, list)
+            and len(declared_timestamps) == frame_count
+            and isinstance(declared_timestamps[index], (int, float))
+        ):
+            target = float(start) + float(declared_timestamps[index])
+            source = str(entry.get("ptsAssociation") or "declared-frame-pts")
+        elif isinstance(start, (int, float)) and isinstance(duration, (int, float)):
             target = float(start) + float(duration) * index / max(1, frame_count - 1)
+            source = "uniform-duration-fallback"
+            uncertainty_ms = abs(float(duration)) / max(1, frame_count - 1)
     if not poses:
-        return index, target, sequence_number
+        return index, target, sequence_number, {
+            "source": source,
+            "uncertaintyMs": uncertainty_ms,
+            "sensorDeltaMs": None,
+        }
     if target is None:
         pose_index = round(index * max(0, len(poses) - 1) / max(1, frame_count - 1))
         value = poses[pose_index].get("monotonicMs")
         target = float(value) if isinstance(value, (int, float)) else None
+        source = "sensor-index-fallback"
     else:
+        timed_pose_indexes = [
+            candidate for candidate, pose in enumerate(poses)
+            if isinstance(pose.get("monotonicMs"), (int, float))
+            and math.isfinite(float(pose["monotonicMs"]))
+        ]
+        def pose_time_distance(candidate: int) -> float:
+            value = poses[candidate].get("monotonicMs")
+            return (
+                abs(float(value) - target)
+                if isinstance(value, (int, float)) and math.isfinite(float(value))
+                else math.inf
+            )
+
         pose_index = min(
-            range(len(poses)),
-            key=lambda candidate: abs(
-                float(poses[candidate].get("monotonicMs", target)) - target
-            ),
+            timed_pose_indexes or range(len(poses)),
+            key=pose_time_distance,
         )
     sample_index = int(poses[pose_index].get("sampleIndex", pose_index))
-    return sample_index, target, sequence_number
+    pose_time = poses[pose_index].get("monotonicMs")
+    sensor_delta_ms = (
+        abs(float(pose_time) - target)
+        if target is not None and isinstance(pose_time, (int, float))
+        else None
+    )
+    return sample_index, target, sequence_number, {
+        "source": source,
+        "uncertaintyMs": uncertainty_ms,
+        "sensorDeltaMs": sensor_delta_ms,
+    }
 
 
 def build_aligned_camera_frames(
     predictions: dict[str, Any],
     manifest: dict[str, Any],
+    input_summary: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Return camera poses in the exact local frame exported by the GLB."""
 
@@ -113,13 +174,14 @@ def build_aligned_camera_frames(
     frames: list[dict[str, Any]] = []
     for index, world_to_camera in enumerate(full):
         camera_to_world = scene_alignment @ np.linalg.inv(world_to_camera)
-        sample_index, monotonic_ms, sequence_number = _pose_for_frame(
-            index, len(full), manifest
+        sample_index, monotonic_ms, sequence_number, time_association = _pose_for_frame(
+            index, len(full), manifest, input_summary
         )
         frame: dict[str, Any] = {
             "sequenceNumber": sequence_number,
             "sensorSampleIndex": sample_index,
             "monotonicMs": monotonic_ms,
+            "timeAssociation": time_association,
             "cameraToWorld": {
                 "positionM": camera_to_world[:3, 3].tolist(),
                 "quaternionXyzw": Rotation.from_matrix(

@@ -256,7 +256,7 @@ class InferenceEngine:
             reconstruction_manifest_path: Path | None = None
             if noclip_manifest is not None:
                 noclip_frames = build_aligned_camera_frames(
-                    prepared_for_export, noclip_manifest
+                    prepared_for_export, noclip_manifest, input_summary
                 )
                 trajectory_path = write_noclip_trajectory(
                     result_dir,

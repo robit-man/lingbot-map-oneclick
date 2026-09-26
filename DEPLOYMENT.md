@@ -137,6 +137,13 @@ convention and SHA-256/size metadata. The LOD is capped by
 enabled; sky masking remains disabled until a representative outdoor field
 corpus demonstrates an accuracy benefit.
 
+Video decoding retains a presentation timestamp for every sampled frame. The
+trajectory maps decoded PTS into the capture monotonic clock and reports the
+time source, uncertainty, and nearest sensor-sample delta per frame. Invalid or
+non-monotonic decoder PTS fall back to source-FPS timing with explicit
+one-frame uncertainty. Downstream alignment remains responsible for bounded
+interpolation and for rejecting evidence outside its validity window.
+
 Persisted completed/failed/cancelled job records are reloaded after restart;
 staging/queued/running records become explicit restart failures, while an
 interrupted cancellation becomes acknowledged. Upload and decoded-frame

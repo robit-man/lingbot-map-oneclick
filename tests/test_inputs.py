@@ -3,7 +3,11 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from webapp.inputs import stage_input_media, validate_image_files
+from webapp.inputs import (
+    resolve_frame_presentation_timestamps,
+    stage_input_media,
+    validate_image_files,
+)
 
 
 def test_validate_image_files_accepts_decodable_images(tmp_path: Path):
@@ -66,3 +70,21 @@ def test_image_preprocessing_stops_at_a_cooperative_checkpoint(tmp_path: Path):
             cancellation_checkpoint=checkpoint,
             progress_callback=lambda *_args: None,
         )
+
+
+def test_decoder_presentation_timestamps_preserve_variable_frame_rate():
+    values, association, uncertainty = resolve_frame_presentation_timestamps(
+        [0.0, 41.5, 109.25], [0, 1, 3], 30.0
+    )
+    assert values == [0.0, 41.5, 109.25]
+    assert association == "decoded-frame-pts"
+    assert uncertainty == 16.667
+
+
+def test_invalid_decoder_timestamps_fall_back_with_explicit_uncertainty():
+    values, association, uncertainty = resolve_frame_presentation_timestamps(
+        [0.0, 0.0, 0.0], [0, 2, 4], 20.0
+    )
+    assert values == [0.0, 100.0, 200.0]
+    assert association == "source-fps-fallback"
+    assert uncertainty == 50.0
